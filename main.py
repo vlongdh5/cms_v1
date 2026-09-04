@@ -190,12 +190,22 @@ def run(mode: str):
             last_run = get_last_run_time(engine)
             current_files = scan_all_files(cfg.folder_map)
 
+            if last_run is not None:
+                if last_run.tzinfo is None:
+                    last_run = last_run.replace(tzinfo=timezone.utc)
+                if last_run > start_time:
+                    # Written by a build that stored local wall-clock as UTC. Trusting
+                    # it would hide every file changed since, so fall back to a full scan.
+                    logger.warning(
+                        f"CLOCK_SKEW — last run recorded at {last_run.isoformat()} is after "
+                        f"this run started ({start_time.isoformat()}); scanning all files"
+                    )
+                    last_run = None
+
             if last_run is None:
                 logger.info("No previous run found, scanning all files")
                 files = current_files
             else:
-                if last_run.tzinfo is None:
-                    last_run = last_run.replace(tzinfo=timezone.utc)
                 # mtime alone is not enough: a file copied in with its original
                 # timestamp, or one that failed to load earlier, would stay
                 # invisible forever. Anything not currently active in the

@@ -5,6 +5,24 @@ from sqlalchemy import (create_engine, text, inspect as sa_inspect,
 
 STATUS_SUCCESS = "success"
 
+
+def _as_naive_utc(dt: datetime) -> datetime:
+    """Drop the tzinfo after converting to UTC.
+
+    The metadata columns are `timestamp without time zone`. Handing psycopg2 an
+    aware datetime makes it send a timestamptz, which PostgreSQL then converts
+    using the *session* time zone — on a server set to Asia/Ho_Chi_Minh the row
+    lands as local wall-clock. Read back and labelled UTC, that timestamp sits
+    hours in the future and the daily scan skips every recently changed file.
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _utc_now() -> datetime:
+    return _as_naive_utc(datetime.now(timezone.utc))
+
 _ALLOWED_COL_TYPES = {"TEXT", "INTEGER", "FLOAT", "TIMESTAMP"}
 _UPGRADE_SKIP_COLS = {"source_file", "uuid"}
 
@@ -475,7 +493,7 @@ def insert_load_metadata(engine: Engine, file_path: str, table_name: str,
         """), {
             "fp": file_path,
             "tn": table_name,
-            "now": datetime.now(timezone.utc),
+            "now": _utc_now(),
             "rc": row_count,
             "st": status,
             "op": operation,
@@ -581,7 +599,7 @@ def insert_run_log(engine: Engine, mode: str, started_at: datetime) -> int:
         meta.reflect(bind=engine, only=["_run_log"])
         run_log_tbl = meta.tables["_run_log"]
         result = conn.execute(
-            sa_insert(run_log_tbl).values(mode=mode, started_at=started_at)
+            sa_insert(run_log_tbl).values(mode=mode, started_at=_as_naive_utc(started_at))
         )
         conn.commit()
         return result.inserted_primary_key[0]
@@ -593,5 +611,5 @@ def finish_run_log(engine: Engine, run_id: int, processed: int, skipped: int, er
             UPDATE _run_log
             SET finished_at = :now, files_processed = :p, files_skipped = :s, errors = :e
             WHERE run_id = :rid
-        """), {"now": datetime.now(timezone.utc), "p": processed, "s": skipped, "e": errors, "rid": run_id})
+        """), {"now": _utc_now(), "p": processed, "s": skipped, "e": errors, "rid": run_id})
         conn.commit()

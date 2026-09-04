@@ -213,12 +213,20 @@ def _column_can_convert_to_numeric(
     """
     Check whether all non-empty values in a TEXT column
     can be safely converted to NUMERIC.
+
+    A column with no values at all is left as TEXT: there is no evidence it is
+    numeric, and upgrading it would reject the first real text value that shows up.
     """
     if engine.dialect.name != "postgresql":
         return False
 
     sql = f'''
-        SELECT NOT EXISTS (
+        SELECT EXISTS (
+            SELECT 1
+            FROM "{table_name}"
+            WHERE "{col}" IS NOT NULL
+              AND BTRIM("{col}"::text) <> ''
+        ) AND NOT EXISTS (
             SELECT 1
             FROM "{table_name}"
             WHERE "{col}" IS NOT NULL
@@ -242,12 +250,19 @@ def _column_can_convert_to_timestamp(
     """
     Check whether all non-empty values in a TEXT column
     look like standard timestamp/date values.
+
+    An empty column stays TEXT — see _column_can_convert_to_numeric.
     """
     if engine.dialect.name != "postgresql":
         return False
 
     sql = f'''
-        SELECT NOT EXISTS (
+        SELECT EXISTS (
+            SELECT 1
+            FROM "{table_name}"
+            WHERE "{col}" IS NOT NULL
+              AND BTRIM("{col}"::text) <> ''
+        ) AND NOT EXISTS (
             SELECT 1
             FROM "{table_name}"
             WHERE "{col}" IS NOT NULL

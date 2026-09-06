@@ -17,7 +17,7 @@ from loader.db import (get_engine, ensure_database, create_metadata_tables,
                         upgrade_column_types, get_active_files,
                         archive_and_delete_file, is_file_loaded)
 from loader.logger import setup_logger
-from loader.file_scanner import scan_all_files, scan_changed_files
+from loader.file_scanner import scan_all_files
 from loader.excel_reader import read_excel
 from loader.loader import load_file, normalize_col_name, build_table_schemas
 from loader.view_manager import save_views, drop_all_views, restore_views
@@ -116,7 +116,18 @@ def run(mode: str):
                     return {"rel": rel, "table": table, "outcome": "skip"}
                 try:
                     stats = load_file(engine, df, table, rel, logger)
+                    if stats["status"] == "failed":
+                        logger.error(
+                            f"LOAD_FAILED — {rel} — 0 of {stats['skipped']} rows accepted, "
+                            f"nothing written"
+                        )
+                        return {"rel": rel, "table": table, "outcome": "error"}
                     logger.info(f"LOADED — {rel} — {stats['loaded']} rows ({stats['skipped']} skipped)")
+                    if stats["skipped"]:
+                        logger.warning(
+                            f"PARTIAL_LOAD — {rel} — {stats['skipped']} rows rejected"
+                        )
+                        return {"rel": rel, "table": table, "outcome": "partial"}
                     return {"rel": rel, "table": table, "outcome": "ok"}
                 except Exception as e:
                     logger.error(f"ERROR — {rel} — {e}")
@@ -142,6 +153,11 @@ def run(mode: str):
                     if result["outcome"] == "ok":
                         processed += 1
                         loaded_tables.add(result["table"])
+                    elif result["outcome"] == "partial":
+                        # Data did land, but rows were dropped — must not read as a clean run.
+                        processed += 1
+                        loaded_tables.add(result["table"])
+                        errors += 1
                     elif result["outcome"] == "skip":
                         skipped += 1
                     else:
@@ -172,13 +188,42 @@ def run(mode: str):
 
         else:  # daily
             last_run = get_last_run_time(engine)
-            if last_run is None:
-                logger.info("No previous run found, scanning all files")
-                files = scan_all_files(cfg.folder_map)
-            else:
+            current_files = scan_all_files(cfg.folder_map)
+
+            if last_run is not None:
                 if last_run.tzinfo is None:
                     last_run = last_run.replace(tzinfo=timezone.utc)
-                files = scan_changed_files(cfg.folder_map, last_run)
+                if last_run > start_time:
+                    # Written by a build that stored local wall-clock as UTC. Trusting
+                    # it would hide every file changed since, so fall back to a full scan.
+                    logger.warning(
+                        f"CLOCK_SKEW — last run recorded at {last_run.isoformat()} is after "
+                        f"this run started ({start_time.isoformat()}); scanning all files"
+                    )
+                    last_run = None
+
+            if last_run is None:
+                logger.info("No previous run found, scanning all files")
+                files = current_files
+            else:
+                # mtime alone is not enough: a file copied in with its original
+                # timestamp, or one that failed to load earlier, would stay
+                # invisible forever. Anything not currently active in the
+                # metadata is picked up regardless of how old it looks.
+                active_rel_paths = {a["file_path"] for a in get_active_files(engine)}
+                files = [
+                    f for f in current_files
+                    if f["modified_at"] > last_run or f["rel_path"] not in active_rel_paths
+                ]
+                n_never_loaded = sum(
+                    1 for f in files
+                    if f["modified_at"] <= last_run and f["rel_path"] not in active_rel_paths
+                )
+                if n_never_loaded:
+                    logger.info(
+                        f"DAILY — {n_never_loaded} file(s) older than last run but never "
+                        f"loaded successfully, including them"
+                    )
 
             logger.info(f"Scanning: {len(files)} files to process")
             total = len(files)
@@ -208,11 +253,23 @@ def run(mode: str):
 
                 try:
                     stats = load_file(engine, df, table, rel, logger)
-                    processed += 1
-                    loaded_tables.add(table)
-                    if new_cols:
-                        new_cols_by_table[table].update(new_cols)
-                    logger.info(f"LOADED — {rel} — {stats['loaded']} rows ({stats['skipped']} skipped)")
+                    if stats["status"] == "failed":
+                        errors += 1
+                        logger.error(
+                            f"LOAD_FAILED — {rel} — 0 of {stats['skipped']} rows accepted, "
+                            f"nothing written (previously loaded rows left untouched)"
+                        )
+                    else:
+                        processed += 1
+                        loaded_tables.add(table)
+                        if new_cols:
+                            new_cols_by_table[table].update(new_cols)
+                        logger.info(f"LOADED — {rel} — {stats['loaded']} rows ({stats['skipped']} skipped)")
+                        if stats["skipped"]:
+                            errors += 1
+                            logger.warning(
+                                f"PARTIAL_LOAD — {rel} — {stats['skipped']} rows rejected"
+                            )
                 except Exception as e:
                     errors += 1
                     logger.error(f"ERROR — {rel} — {e}")
@@ -228,25 +285,38 @@ def run(mode: str):
 
             # Detect and archive deleted files
             logger.info("DAILY — checking for deleted files")
-            folder_name_map = {Path(folder).name: folder for folder in cfg.folder_map}
+
+            # Files currently existing in source folders (scanned above)
+            current_rel_paths = {
+                f["rel_path"]
+                for f in current_files
+            }
+
             active_files = get_active_files(engine)
+
+            logger.info(
+                f"DAILY — active metadata files={len(active_files)}, "
+                f"current source files={len(current_rel_paths)}"
+            )
             for active in active_files:
                 rel = active["file_path"]
                 table = active["table_name"]
-                parts = Path(rel).parts
-                if not parts:
-                    continue
-                abs_folder = folder_name_map.get(parts[0])
-                if abs_folder is None:
-                    continue
-                abs_path = Path(abs_folder).joinpath(*parts[1:])
-                if not abs_path.exists():
+
+                if rel not in current_rel_paths:
                     try:
-                        archive_and_delete_file(engine, rel, table, logger)
+                        archive_and_delete_file(
+                            engine,
+                            rel,
+                            table,
+                            logger
+                        )
                         deleted += 1
+
                     except Exception as e:
                         errors += 1
-                        logger.error(f"DELETE_FAILED — {rel} — {e}")
+                        logger.error(
+                            f"DELETE_FAILED — {rel} — {e}"
+                        )
 
     finally:
         if mode == "init":
@@ -256,7 +326,13 @@ def run(mode: str):
             except Exception as e:
                 logger.error(f"FINAL_TYPE_UPGRADE_FAILED — customer_data.ngay_sinh — {e}")
         finish_run_log(engine, run_id, processed, skipped, errors)
-        logger.info(f"Run finished — {processed} loaded, {skipped} skipped, {errors} errors, {deleted} deleted")
+        summary = f"Run finished — {processed} loaded, {skipped} skipped, {errors} errors, {deleted} deleted"
+        if errors:
+            logger.error(summary)
+        else:
+            logger.info(summary)
+
+    return errors
 
 
 def run_scripts(script_path: str | None = None):
@@ -308,7 +384,10 @@ def main():
     if args.mode == "run_script":
         run_scripts(args.script)
     else:
-        run(args.mode)
+        # Non-zero exit so a failed load is visible to cron / CI instead of
+        # being reported as a clean run.
+        if run(args.mode):
+            sys.exit(1)
 
 
 if __name__ == "__main__":

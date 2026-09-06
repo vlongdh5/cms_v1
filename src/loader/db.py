@@ -5,6 +5,24 @@ from sqlalchemy import (create_engine, text, inspect as sa_inspect,
 
 STATUS_SUCCESS = "success"
 
+
+def _as_naive_utc(dt: datetime) -> datetime:
+    """Drop the tzinfo after converting to UTC.
+
+    The metadata columns are `timestamp without time zone`. Handing psycopg2 an
+    aware datetime makes it send a timestamptz, which PostgreSQL then converts
+    using the *session* time zone — on a server set to Asia/Ho_Chi_Minh the row
+    lands as local wall-clock. Read back and labelled UTC, that timestamp sits
+    hours in the future and the daily scan skips every recently changed file.
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _utc_now() -> datetime:
+    return _as_naive_utc(datetime.now(timezone.utc))
+
 _ALLOWED_COL_TYPES = {"TEXT", "INTEGER", "FLOAT", "TIMESTAMP"}
 _UPGRADE_SKIP_COLS = {"source_file", "uuid"}
 
@@ -116,13 +134,43 @@ def create_table_with_columns(engine: Engine, table_name: str, columns: list[str
         conn.commit()
 
 
-_UPGRADE_CANDIDATE_TYPES = ("NUMERIC", "TIMESTAMP")
-
+# _UPGRADE_CANDIDATE_TYPES = ("NUMERIC", "TIMESTAMP")
 
 def _upgrade_birth_date_column(engine: Engine, table_name: str, col: str, logger=None) -> bool:
     """Try to convert Excel-serial/text birthday values to DATE in PostgreSQL."""
     if engine.dialect.name != "postgresql":
         return False
+
+    try:
+        inspector = sa_inspect(engine)
+        column_info = next(
+            (
+                c
+                for c in inspector.get_columns(table_name)
+                if c["name"] == col
+            ),
+            None,
+        )
+
+        if not column_info:
+            return False
+
+        current_type = str(column_info["type"]).upper()
+
+        # Đã là DATE thì không cần upgrade lại
+        if current_type.startswith("DATE"):
+            if logger:
+                logger.debug(
+                    f"TYPE_KEEP_DATE — {table_name}.{col}"
+                )
+            return True
+    except Exception as e:
+        if logger:
+            logger.debug(
+                f"TYPE_CHECK_SKIP — {table_name}.{col}: {e}"
+            )
+        return False
+
     try:
         with engine.connect() as conn:
             sql = f'''
@@ -175,35 +223,257 @@ def _upgrade_birth_date_column(engine: Engine, table_name: str, col: str, logger
         return False
 
 
-def upgrade_column_types(engine: Engine, table_name: str, logger=None,
-                          cols: list[str] | None = None):
+def _column_can_convert_to_numeric(
+    engine: Engine,
+    table_name: str,
+    col: str,
+) -> bool:
+    """
+    Check whether all non-empty values in a TEXT column
+    can be safely converted to NUMERIC.
+
+    A column with no values at all is left as TEXT: there is no evidence it is
+    numeric, and upgrading it would reject the first real text value that shows up.
+    """
+    if engine.dialect.name != "postgresql":
+        return False
+
+    sql = f'''
+        SELECT EXISTS (
+            SELECT 1
+            FROM "{table_name}"
+            WHERE "{col}" IS NOT NULL
+              AND BTRIM("{col}"::text) <> ''
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM "{table_name}"
+            WHERE "{col}" IS NOT NULL
+              AND BTRIM("{col}"::text) <> ''
+              AND BTRIM("{col}"::text) !~
+                  '^[+-]?([0-9]+(\\.[0-9]+)?|\\.[0-9]+)$'
+        )
+    '''
+
+    try:
+        with engine.connect() as conn:
+            return bool(conn.execute(text(sql)).scalar())
+    except Exception:
+        return False
+
+def _column_can_convert_to_timestamp(
+    engine: Engine,
+    table_name: str,
+    col: str,
+) -> bool:
+    """
+    Check whether all non-empty values in a TEXT column
+    look like standard timestamp/date values.
+
+    An empty column stays TEXT — see _column_can_convert_to_numeric.
+    """
+    if engine.dialect.name != "postgresql":
+        return False
+
+    sql = f'''
+        SELECT EXISTS (
+            SELECT 1
+            FROM "{table_name}"
+            WHERE "{col}" IS NOT NULL
+              AND BTRIM("{col}"::text) <> ''
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM "{table_name}"
+            WHERE "{col}" IS NOT NULL
+              AND BTRIM("{col}"::text) <> ''
+              AND BTRIM("{col}"::text) !~
+                  '^\\d{{4}}-\\d{{2}}-\\d{{2}}([ T]\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?)?$'
+        )
+    '''
+
+    try:
+        with engine.connect() as conn:
+            return bool(conn.execute(text(sql)).scalar())
+    except Exception:
+        return False
+
+def _upgrade_column_to_type(
+    engine: Engine,
+    table_name: str,
+    col: str,
+    sql_type: str,
+    logger=None,
+) -> bool:
+    """
+    Perform the actual PostgreSQL type conversion.
+    """
+    if engine.dialect.name != "postgresql":
+        return False
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(
+                f'ALTER TABLE "{table_name}" '
+                f'ALTER COLUMN "{col}" TYPE {sql_type} '
+                f'USING "{col}"::{sql_type}'
+            ))
+            conn.commit()
+
+        if logger:
+            logger.info(
+                f"TYPE_UPGRADE — {table_name}.{col} → {sql_type}"
+            )
+
+        return True
+
+    except Exception as e:
+        if logger:
+            logger.debug(
+                f"SKIP_UPGRADE — {table_name}.{col} → "
+                f"{sql_type}: {e}"
+            )
+
+        return False
+
+
+def upgrade_column_types(
+    engine: Engine,
+    table_name: str,
+    logger=None,
+    cols: list[str] | None = None,
+):
+    """
+    Upgrade TEXT columns only when their actual data
+    clearly matches NUMERIC or TIMESTAMP.
+    """
+
     all_cols = get_table_columns(engine, table_name)
+
     if not all_cols:
         if logger:
-            logger.warning(f"TYPE_UPGRADE — {table_name} not found, skipping")
+            logger.warning(
+                f"TYPE_UPGRADE — {table_name} not found, skipping"
+            )
         return
+
     target_cols = cols if cols is not None else all_cols
+
     for col in target_cols:
+
+        # Skip system / identifier columns
         if col in _UPGRADE_SKIP_COLS or _is_identifier_col(col):
             continue
+
+        # Special handling for customer_data.ngay_sinh
         if table_name == "customer_data" and col == "ngay_sinh":
-            _upgrade_birth_date_column(engine, table_name, col, logger)
+            _upgrade_birth_date_column(
+                engine,
+                table_name,
+                col,
+                logger,
+            )
             continue
-        for sql_type in _UPGRADE_CANDIDATE_TYPES:
-            try:
-                with engine.connect() as conn:
-                    conn.execute(text(
-                        f'ALTER TABLE "{table_name}" '
-                        f'ALTER COLUMN "{col}" TYPE {sql_type} '
-                        f'USING "{col}"::{sql_type}'
-                    ))
-                    conn.commit()
-                if logger:
-                    logger.info(f"TYPE_UPGRADE — {table_name}.{col} → {sql_type}")
-                break
-            except Exception as e:
-                if logger:
-                    logger.debug(f"SKIP_UPGRADE — {table_name}.{col} → {sql_type}: {e}")
+
+        # Get current database type
+        try:
+            inspector = sa_inspect(engine)
+
+            column_info = next(
+                (
+                    c
+                    for c in inspector.get_columns(table_name)
+                    if c["name"] == col
+                ),
+                None,
+            )
+
+            if not column_info:
+                continue
+
+            current_type = str(column_info["type"]).upper()
+
+            # Only automatically upgrade TEXT columns
+            if not current_type.startswith("TEXT"):
+                continue
+
+        except Exception as e:
+            if logger:
+                logger.debug(
+                    f"TYPE_CHECK_SKIP — "
+                    f"{table_name}.{col}: {e}"
+                )
+            continue
+
+        # --------------------------------------------------
+        # 1. NUMERIC
+        # --------------------------------------------------
+        if _column_can_convert_to_numeric(
+            engine,
+            table_name,
+            col,
+        ):
+            if _upgrade_column_to_type(
+                engine,
+                table_name,
+                col,
+                "NUMERIC",
+                logger,
+            ):
+                continue
+
+        # --------------------------------------------------
+        # 2. TIMESTAMP
+        # --------------------------------------------------
+        if _column_can_convert_to_timestamp(
+            engine,
+            table_name,
+            col,
+        ):
+            if _upgrade_column_to_type(
+                engine,
+                table_name,
+                col,
+                "TIMESTAMP",
+                logger,
+            ):
+                continue
+
+        # --------------------------------------------------
+        # 3. Keep TEXT
+        # --------------------------------------------------
+        if logger:
+            logger.debug(
+                f"TYPE_KEEP_TEXT — {table_name}.{col}"
+            )
+
+# def upgrade_column_types(engine: Engine, table_name: str, logger=None,
+#                           cols: list[str] | None = None):
+#     all_cols = get_table_columns(engine, table_name)
+#     if not all_cols:
+#         if logger:
+#             logger.warning(f"TYPE_UPGRADE — {table_name} not found, skipping")
+#         return
+#     target_cols = cols if cols is not None else all_cols
+#     for col in target_cols:
+#         if col in _UPGRADE_SKIP_COLS or _is_identifier_col(col):
+#             continue
+#         if table_name == "customer_data" and col == "ngay_sinh":
+#             _upgrade_birth_date_column(engine, table_name, col, logger)
+#             continue
+#         for sql_type in _UPGRADE_CANDIDATE_TYPES:
+#             try:
+#                 with engine.connect() as conn:
+#                     conn.execute(text(
+#                         f'ALTER TABLE "{table_name}" '
+#                         f'ALTER COLUMN "{col}" TYPE {sql_type} '
+#                         f'USING "{col}"::{sql_type}'
+#                     ))
+#                     conn.commit()
+#                 if logger:
+#                     logger.info(f"TYPE_UPGRADE — {table_name}.{col} → {sql_type}")
+#                 break
+#             except Exception as e:
+#                 if logger:
+#                     logger.debug(f"SKIP_UPGRADE — {table_name}.{col} → {sql_type}: {e}")
 
 
 def get_last_run_time(engine: Engine) -> datetime | None:
@@ -223,7 +493,7 @@ def insert_load_metadata(engine: Engine, file_path: str, table_name: str,
         """), {
             "fp": file_path,
             "tn": table_name,
-            "now": datetime.now(timezone.utc),
+            "now": _utc_now(),
             "rc": row_count,
             "st": status,
             "op": operation,
@@ -329,7 +599,7 @@ def insert_run_log(engine: Engine, mode: str, started_at: datetime) -> int:
         meta.reflect(bind=engine, only=["_run_log"])
         run_log_tbl = meta.tables["_run_log"]
         result = conn.execute(
-            sa_insert(run_log_tbl).values(mode=mode, started_at=started_at)
+            sa_insert(run_log_tbl).values(mode=mode, started_at=_as_naive_utc(started_at))
         )
         conn.commit()
         return result.inserted_primary_key[0]
@@ -341,5 +611,5 @@ def finish_run_log(engine: Engine, run_id: int, processed: int, skipped: int, er
             UPDATE _run_log
             SET finished_at = :now, files_processed = :p, files_skipped = :s, errors = :e
             WHERE run_id = :rid
-        """), {"now": datetime.now(timezone.utc), "p": processed, "s": skipped, "e": errors, "rid": run_id})
+        """), {"now": _utc_now(), "p": processed, "s": skipped, "e": errors, "rid": run_id})
         conn.commit()

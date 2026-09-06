@@ -140,3 +140,46 @@ def test_save_drop_restore_roundtrip(engine, tmp_path):
     assert "v_roundtrip" not in sa_inspect(engine).get_view_names()
     restore_views(engine, tmp_path, logger=None)
     assert "v_roundtrip" in sa_inspect(engine).get_view_names()
+
+
+def test_view_target_re_matches_materialized_view():
+    """The schema-creation lookup must recognise matview DDL, which starts with a DROP."""
+    from loader.view_manager import _VIEW_TARGET_RE
+
+    ddl = (
+        'DROP MATERIALIZED VIEW IF EXISTS "Update_Bills"."updatebill" CASCADE;\n'
+        'CREATE MATERIALIZED VIEW "Update_Bills"."updatebill" AS\n'
+        'SELECT 1;'
+    )
+    match = _VIEW_TARGET_RE.search(ddl)
+    assert match is not None
+    assert match.group("schema") == "Update_Bills"
+    assert match.group("name") == "updatebill"
+
+    plain = 'CREATE OR REPLACE VIEW "Update_Customer_Info"."Newcustomerinfo" AS SELECT 1;'
+    match = _VIEW_TARGET_RE.search(plain)
+    assert match.group("schema") == "Update_Customer_Info"
+
+
+def test_restore_views_retries_dependent_views(engine, tmp_path):
+    """A view depending on another must restore even when filename order is wrong."""
+    from loader.view_manager import restore_views
+    from sqlalchemy import inspect as sa_inspect
+
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE base (id INTEGER)"))
+        conn.commit()
+
+    # "a_" sorts first but depends on "b_", which has not been created yet
+    (tmp_path / "a_dependent.sql").write_text(
+        'CREATE VIEW "a_dependent" AS SELECT id FROM "b_source";'
+    )
+    (tmp_path / "b_source.sql").write_text(
+        'CREATE VIEW "b_source" AS SELECT id FROM base;'
+    )
+
+    restored, failed = restore_views(engine, tmp_path, logger=None)
+
+    assert (restored, failed) == (2, 0)
+    view_names = sa_inspect(engine).get_view_names()
+    assert "a_dependent" in view_names and "b_source" in view_names

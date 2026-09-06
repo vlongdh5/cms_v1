@@ -271,6 +271,93 @@ def test_load_file_fallback_dot_zero_text_to_empty(engine):
     assert set(r[0] for r in rows) == {"", "huy", " x "}
 
 
+def test_coerce_excel_serial_into_date_column():
+    """After init upgrades ngay_sinh to DATE, daily must not push raw Excel serials at it."""
+    from datetime import date
+    from sqlalchemy import types as sa_types
+    from loader.loader import _coerce_value
+
+    assert _coerce_value(33330, sa_types.DATE(), "ngay_sinh") == date(1991, 4, 2)
+    assert _coerce_value("33330", sa_types.DATE(), "ngay_sinh") == date(1991, 4, 2)
+    assert _coerce_value("1991-04-02", sa_types.DATE(), "ngay_sinh") == date(1991, 4, 2)
+    assert _coerce_value("02/04/1991", sa_types.DATE(), "ngay_sinh") == date(1991, 4, 2)
+    assert _coerce_value("19910402", sa_types.DATE(), "ngay_sinh") == date(1991, 4, 2)
+    # unparseable and out-of-range values become NULL instead of failing the row
+    assert _coerce_value("khong-phai-ngay", sa_types.DATE(), "ngay_sinh") is None
+    assert _coerce_value(3_000_000_000, sa_types.DATE(), "ngay_sinh") is None
+
+
+def test_coerce_timestamp_column_keeps_time():
+    from datetime import datetime
+    from sqlalchemy import types as sa_types
+    from loader.loader import _coerce_value
+
+    got = _coerce_value("2026-09-04 07:50:39.31", sa_types.TIMESTAMP(), "ngay_tao")
+    assert got == datetime(2026, 9, 4, 7, 50, 39, 310000)
+
+
+def test_load_file_into_date_column(engine):
+    """Reloading a file whose date column is already typed must still insert rows."""
+    from loader.loader import load_file
+    from loader.db import create_metadata_tables
+
+    create_metadata_tables(engine)
+    with engine.connect() as conn:
+        conn.execute(text('CREATE TABLE cust (id INTEGER, ngay_sinh DATE, source_file TEXT)'))
+        conn.commit()
+
+    df = pd.DataFrame({"ID": [1, 2], "Ngày sinh": [33330, 33331]})
+    stats = load_file(engine, df, "cust", "customer_data/c.xlsx", logger=None)
+
+    assert stats["loaded"] == 2
+    assert stats["status"] == "success"
+    with engine.connect() as conn:
+        rows = conn.execute(text('SELECT "ngay_sinh" FROM cust ORDER BY "id"')).fetchall()
+    # str() so the assert holds for both SQLite (text) and PostgreSQL (date objects)
+    assert [str(r[0]) for r in rows] == ["1991-04-02", "1991-04-03"]
+
+
+def test_failed_reload_keeps_previous_rows(engine):
+    """If every row of a re-exported file is rejected, the old rows must survive."""
+    from loader.loader import load_file
+    from loader.db import create_metadata_tables
+
+    create_metadata_tables(engine)
+    with engine.connect() as conn:
+        conn.execute(text('CREATE TABLE bills (bill_id INTEGER, amount FLOAT, source_file TEXT)'))
+        conn.commit()
+
+    good = pd.DataFrame({"bill_id": [1, 2], "amount": [100.0, 200.0]})
+    assert load_file(engine, good, "bills", "cancel/x.xlsx", logger=None)["loaded"] == 2
+
+    broken = pd.DataFrame({"bill_id": [3, 4], "amount": ["nope", "nope"]})
+    stats = load_file(engine, broken, "bills", "cancel/x.xlsx", logger=None)
+
+    assert stats["loaded"] == 0
+    assert stats["status"] == "failed"
+    with engine.connect() as conn:
+        rows = conn.execute(text('SELECT "bill_id" FROM bills ORDER BY "bill_id"')).fetchall()
+    assert [r[0] for r in rows] == [1, 2]
+
+
+def test_partial_reload_keeps_the_rows_that_work(engine):
+    """One bad row must not take the rest of the file down with it."""
+    from loader.loader import load_file
+    from loader.db import create_metadata_tables
+
+    create_metadata_tables(engine)
+    with engine.connect() as conn:
+        conn.execute(text('CREATE TABLE bills2 (bill_id INTEGER, amount FLOAT, source_file TEXT)'))
+        conn.commit()
+
+    df = pd.DataFrame({"bill_id": [1, 2, 3], "amount": [100.0, "nope", 300.0]})
+    stats = load_file(engine, df, "bills2", "cancel/y.xlsx", logger=None)
+
+    assert stats["loaded"] == 2
+    assert stats["skipped"] == 1
+    assert stats["status"] == "partial"
+
+
 def test_load_file_logs_insert_operation(engine):
     from loader.loader import load_file
     from loader.db import create_metadata_tables

@@ -1,6 +1,7 @@
 import re
 import unicodedata
 from collections import defaultdict
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 from sqlalchemy import Engine, inspect, text, types as sa_types
@@ -51,6 +52,92 @@ def _is_relative_info_col(col_name: str | None) -> bool:
     return bool(col_name and col_name.lower() == "thong_tin_nguoi_than")
 
 
+# Excel stores dates as days since 1899-12-30 (the 1900 leap-year bug included).
+_EXCEL_EPOCH = date(1899, 12, 30)
+_MIN_VALID_DATE = date(1900, 1, 1)
+
+# Columns where a future value is meaningless. Mirrors the CURRENT_DATE guard in
+# db._upgrade_birth_date_column so an init-loaded row and a daily-loaded row of
+# the same file end up with the same value.
+_BIRTH_DATE_COLS = {"ngay_sinh"}
+
+_DATE_TEXT_FORMATS = (
+    (re.compile(r"^\d{8}$"), "%Y%m%d"),
+    (re.compile(r"^\d{2}/\d{2}/\d{4}$"), "%d/%m/%Y"),
+)
+_ISO_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}:\d{2}(\.\d+)?)?$")
+_NUMERIC_TEXT_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
+
+def _excel_serial_to_datetime(value) -> datetime | None:
+    try:
+        serial = float(value)
+    except (TypeError, ValueError):
+        return None
+    if serial <= 0:
+        return None
+    whole_days = int(serial)
+    seconds = round((serial - whole_days) * 86400)
+    try:
+        return datetime.combine(_EXCEL_EPOCH + timedelta(days=whole_days), datetime.min.time()) \
+            + timedelta(seconds=seconds)
+    except (OverflowError, OSError, ValueError):
+        # Nonsense serial (out of the representable date range) → NULL, same as
+        # the ELSE NULL branch of the SQL upgrade. Never kill the row over it.
+        return None
+
+
+def _to_datetime(v) -> datetime | None:
+    """Excel serial / datetime / common text formats → datetime, None if unparseable."""
+    if isinstance(v, datetime):          # pandas Timestamp subclasses datetime
+        return v
+    if isinstance(v, date):              # must come after datetime — datetime is a date
+        return datetime.combine(v, datetime.min.time())
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return _excel_serial_to_datetime(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        for pattern, fmt in _DATE_TEXT_FORMATS:
+            if pattern.match(s):
+                try:
+                    return datetime.strptime(s, fmt)
+                except ValueError:
+                    return None
+        if _ISO_DATETIME_RE.match(s):
+            try:
+                return datetime.fromisoformat(s)
+            except ValueError:
+                # fromisoformat is strict about fractional-second width before 3.11
+                for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f"):
+                    try:
+                        return datetime.strptime(s, fmt)
+                    except ValueError:
+                        continue
+                return None
+        if _NUMERIC_TEXT_RE.match(s):
+            return _excel_serial_to_datetime(s)
+        return None
+    # Decimal and other numeric-ish objects
+    return _excel_serial_to_datetime(v)
+
+
+def _coerce_date_like(v, sa_type, col_name: str | None):
+    """Coerce a value into what a DATE / TIMESTAMP column will accept."""
+    dt = _to_datetime(v)
+    if dt is None:
+        return None
+    if isinstance(sa_type, sa_types.DateTime):
+        return dt
+    d = dt.date()
+    if col_name in _BIRTH_DATE_COLS and not (_MIN_VALID_DATE <= d <= date.today()):
+        return None
+    return d
+
+
 def _coerce_value(v, sa_type, col_name: str | None = None) -> object:
     """Return v coerced to the SQLAlchemy column type, or None for NaN/NA."""
     try:
@@ -91,6 +178,11 @@ def _coerce_value(v, sa_type, col_name: str | None = None) -> object:
         else:
             if numeric.is_integer():
                 return int(numeric)
+    if isinstance(sa_type, (sa_types.Date, sa_types.DateTime)):
+        # After init, upgrade_column_types turns columns such as ngay_sinh into
+        # DATE. Raw Excel serials would then be rejected by the driver, so they
+        # must be converted here instead of being passed through untouched.
+        return _coerce_date_like(v, sa_type, col_name)
     if isinstance(v, str) and v.strip() == ".0":
         return ""
     if isinstance(sa_type, sa_types.Numeric):
@@ -167,13 +259,6 @@ def load_file(engine: Engine, df: pd.DataFrame, table_name: str,
 
     already_loaded = is_file_loaded(engine, rel_path)
     operation = "UPDATE" if already_loaded else "INSERT"
-    if already_loaded:
-        with engine.connect() as conn:
-            conn.execute(
-                text(f'DELETE FROM "{table_name}" WHERE source_file = :fp'),
-                {"fp": rel_path},
-            )
-            conn.commit()
 
     df["source_file"] = rel_path
 
@@ -190,51 +275,74 @@ def load_file(engine: Engine, df: pd.DataFrame, table_name: str,
     loaded = 0
     skipped = 0
     chunk_size = 500
+    total_rows = len(df)
 
-    for chunk_start in range(0, len(df), chunk_size):
-        chunk = df.iloc[chunk_start : chunk_start + chunk_size]
+    # The replace of an already-loaded file and the insert of its new rows share
+    # one transaction: if every row is rejected, the DELETE is rolled back too and
+    # the previously loaded data survives instead of being wiped.
+    conn = engine.connect()
+    trans = conn.begin()
+    try:
+        if already_loaded:
+            conn.execute(
+                text(f'DELETE FROM "{table_name}" WHERE source_file = :fp'),
+                {"fp": rel_path},
+            )
 
-        # Build param dicts, catching per-row coercion errors immediately
-        good_records: list[tuple[int, dict]] = []
-        for idx, row in chunk.iterrows():
+        for chunk_start in range(0, total_rows, chunk_size):
+            chunk = df.iloc[chunk_start : chunk_start + chunk_size]
+
+            # Build param dicts, catching per-row coercion errors immediately
+            good_records: list[tuple[int, dict]] = []
+            for idx, row in chunk.iterrows():
+                try:
+                    record = {
+                        f"p{i}": _coerce_value(v, col_sa_types.get(k), k)
+                        for i, (k, v) in enumerate(row.items())
+                    }
+                    good_records.append((idx, record))
+                except Exception as e:
+                    skipped += 1
+                    if logger:
+                        logger.warning(f"SKIP_ROW — {rel_path} — row {idx} — {e}")
+
+            if not good_records:
+                continue
+
+            # Attempt bulk insert for this chunk
             try:
-                record = {
-                    f"p{i}": _coerce_value(v, col_sa_types.get(k), k)
-                    for i, (k, v) in enumerate(row.items())
-                }
-                good_records.append((idx, record))
-            except Exception as e:
-                skipped += 1
+                param_list = [r for _, r in good_records]
+                with conn.begin_nested():
+                    conn.execute(stmt, param_list)
+                loaded += len(good_records)
+            except Exception as bulk_exc:
                 if logger:
-                    logger.warning(f"SKIP_ROW — {rel_path} — row {idx} — {e}")
-
-        if not good_records:
-            continue
-
-        # Attempt bulk insert for this chunk
-        try:
-            param_list = [r for _, r in good_records]
-            with engine.connect() as conn:
-                conn.execute(stmt, param_list)
-                conn.commit()
-            loaded += len(good_records)
-        except Exception as bulk_exc:
-            if logger:
-                logger.warning(
-                    f"BULK_FAIL — {rel_path} — chunk starting row {chunk_start} — {bulk_exc}"
-                )
-            # Fallback: row-by-row so individual bad rows are skipped
-            with engine.connect() as conn:
+                    logger.warning(
+                        f"BULK_FAIL — {rel_path} — chunk starting row {chunk_start} — {bulk_exc}"
+                    )
+                # Fallback: row-by-row. Each row gets its own SAVEPOINT so one bad
+                # row leaves the surrounding transaction usable for the rest.
                 for idx, record in good_records:
                     try:
-                        conn.execute(stmt, record)
-                        conn.commit()
+                        with conn.begin_nested():
+                            conn.execute(stmt, record)
                         loaded += 1
                     except Exception as e:
                         skipped += 1
                         if logger:
                             logger.warning(f"SKIP_ROW — {rel_path} — row {idx} — {e}")
 
-    status = "success" if skipped == 0 else "partial"
+        if loaded == 0 and total_rows > 0:
+            trans.rollback()
+            status = "failed"
+        else:
+            trans.commit()
+            status = "partial" if skipped else "success"
+    except Exception:
+        trans.rollback()
+        raise
+    finally:
+        conn.close()
+
     insert_load_metadata(engine, rel_path, table_name, loaded, status, operation)
-    return {"loaded": loaded, "skipped": skipped}
+    return {"loaded": loaded, "skipped": skipped, "status": status}
